@@ -3,12 +3,13 @@ use crate::cache::CacheService;
 use crate::config::Config;
 use crate::error::{IndexerError, IndexerResult};
 use crate::models::{EventUpdate, UpdateType};
+use crate::metrics::IndexingMetrics;
 use crate::parser::EventParser;
 use crate::repository::EventRepository;
 use ethers::prelude::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 fn backfill_resume_block(from_block: u64, last_indexed: i64) -> u64 {
@@ -52,6 +53,9 @@ pub struct IndexerService {
 
     /// Current indexing state
     is_running: Arc<RwLock<bool>>,
+
+    /// Throughput and backlog metrics shared with monitoring endpoints.
+    metrics: Arc<IndexingMetrics>,
 }
 
 impl IndexerService {
@@ -80,6 +84,7 @@ impl IndexerService {
             cache: Arc::new(RwLock::new(cache)),
             config,
             is_running: Arc::new(RwLock::new(false)),
+            metrics: Arc::new(IndexingMetrics::new(10_000)),
         })
     }
 
@@ -159,13 +164,19 @@ impl IndexerService {
                 let mut batch_start = from_block;
                 let batch_size = self.config.indexer.batch_size.max(1);
                 while batch_start <= to_block {
-                    let batch_end = backfill_batch_end(batch_start, batch_size, to_block);
+                    let batch_end =
+                        std::cmp::min(batch_start + self.config.indexer.batch_size - 1, to_block);
+                    let batch_started = Instant::now();
 
                     match self
                         .index_block_range(&metadata.contract_address, batch_start, batch_end)
                         .await
                     {
                         Ok(count) => {
+                            self.metrics.record_batch(
+                                count as u64,
+                                batch_started.elapsed().as_millis() as u64,
+                            );
                             info!(
                                 "Indexed {} events for {} from blocks {}-{}",
                                 count, metadata.contract_address, batch_start, batch_end
@@ -177,6 +188,7 @@ impl IndexerService {
                                 .await?;
                         }
                         Err(e) => {
+                            self.metrics.record_error();
                             error!(
                                 "Failed to index blocks {}-{} for {}: {}",
                                 batch_start, batch_end, metadata.contract_address, e
@@ -208,6 +220,17 @@ impl IndexerService {
                 }
             }
 
+            let oldest_indexed = self
+                .repository
+                .get_active_metadata()
+                .await?
+                .into_iter()
+                .map(|metadata| metadata.last_indexed_block)
+                .min()
+                .unwrap_or(current_block);
+            self.metrics
+                .update_backlog(current_block.saturating_sub(oldest_indexed));
+
             // Wait before next poll
             sleep(Duration::from_secs(self.config.indexer.poll_interval)).await;
         }
@@ -222,51 +245,9 @@ impl IndexerService {
         info!("Stopping indexer service");
     }
 
-    /// Index an inclusive block range, persisting progress after every batch.
-    /// Calling this method again with the same range resumes after the last
-    /// completed batch; event inserts are idempotent on transaction hash/log index.
-    pub async fn backfill(
-        &self,
-        contract_address: &str,
-        from_block: u64,
-        to_block: u64,
-    ) -> IndexerResult<BackfillResult> {
-        if from_block > to_block || to_block > i64::MAX as u64 {
-            return Err(IndexerError::InvalidBlockRange {
-                from: from_block,
-                to: to_block,
-            });
-        }
-        if !self.parser.read().await.has_contract(contract_address) {
-            return Err(IndexerError::ContractNotFound(contract_address.to_owned()));
-        }
-
-        let last_indexed = self
-            .repository
-            .get_or_create_backfill_checkpoint(contract_address, from_block, to_block)
-            .await?;
-        let resumed_from_block = backfill_resume_block(from_block, last_indexed);
-        let batch_size = self.config.indexer.batch_size.max(1);
-        let mut batch_start = resumed_from_block;
-        let mut indexed_events = 0;
-
-        while batch_start <= to_block {
-            let batch_end = backfill_batch_end(batch_start, batch_size, to_block);
-            indexed_events += self
-                .index_block_range(contract_address, batch_start, batch_end)
-                .await?;
-            self.repository
-                .update_backfill_checkpoint(contract_address, from_block, to_block, batch_end)
-                .await?;
-            batch_start = batch_end.saturating_add(1);
-        }
-
-        Ok(BackfillResult {
-            from_block,
-            to_block,
-            resumed_from_block,
-            indexed_events,
-        })
+    /// Return a point-in-time snapshot for health and performance reporting.
+    pub fn metrics(&self) -> crate::metrics::MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Index events in a specific block range for a contract
