@@ -70,6 +70,8 @@ stellar-lend/fuzz/coverage/
 *.snap.bak
 tests/e2e/e2e-report.json
 tests/e2e/e2e-report.json
+*.snap.tmp
+*.snap.bak
 
 # Database files
 *.db
@@ -107,6 +109,12 @@ mimo_*.log
 
 issue.md
 pr.md
+
+# additional ignores
+*.snap
+**/*.snap
+__snapshots__/
+**/__snapshots__/
 
 # Generated test / indexing artifacts
 tests/e2e/reports/
